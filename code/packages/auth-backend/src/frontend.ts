@@ -4,7 +4,12 @@ import type { IncomingMessage, ServerResponse } from "node:http"
 import { createRemoteJWKSet, jwtVerify, SignJWT } from "jose"
 
 import { credentialsRemediation, loadGoogleCredentials } from "./credentials.js"
-import { configureEmbeddedVerification } from "./verify.js"
+import {
+  configureEmbeddedVerification,
+  createEmbeddedVerifier,
+  type VerifyTokenOptions,
+} from "./verify.js"
+import type { TokenClaims } from "./types.js"
 import type { SessionMembership, SessionStore, StoredSession } from "./session-store.js"
 import {
   buildSamlClient,
@@ -25,6 +30,9 @@ import {
  * separate auth server process:
  *
  *   GET  /sign_in/sso                         → 302 to Google's OAuth 2.0 / OIDC authorize URL
+ *   GET  /sign_in/sso?strategy=x              → 302 to X's OAuth 2.0 authorize URL (PKCE, no OIDC)
+ *   GET  /oauth_callback/x                    → code→token exchange, then GET /2/users/me for the
+ *                                               identity, then the same finishSignIn() tail
  *   GET  /oauth_callback                      → code→token exchange, id_token + hd verification,
  *                                               establishes the session cookie, 302 back to the SPA
  *   GET  /environment                         → instance configuration (hosted-IdP-style, secret-free)
@@ -46,6 +54,21 @@ const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 const GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"]
 
+// --- X (Twitter) OAuth 2.0 -----------------------------------------------------------------------
+//
+// X IS NOT AN OIDC PROVIDER. There is no id_token, no JWKS and no signature to verify, so the
+// identity cannot be read out of the token response the way Google's is. It is read from the API
+// under the freshly minted access token instead (`fetchXIdentity`), which is why the X path has one
+// more network hop than the Google path and why that hop is not optional.
+const X_AUTH_URL = "https://x.com/i/oauth2/authorize"
+const X_TOKEN_URL = "https://api.x.com/2/oauth2/token"
+const X_ME_URL = "https://api.x.com/2/users/me"
+// `users.email` is what makes `confirmed_email` come back from /2/users/me. X refuses the scope
+// unless the application has "Request email from users" enabled in the developer portal, and an
+// account with no confirmed email address still answers without the field — so a missing email is a
+// NORMAL outcome here, not an error, and `finishSignIn` is what decides whether it is admissible.
+const X_SCOPES = "tweet.read users.read users.email"
+
 // `jose` v5 is a dual ESM/CJS package (its package.json `exports` has a `require` entry), so the
 // static import above is safe from a CommonJS host (NestJS): NodeNext compiles it to
 // `require("jose")`, resolving to jose's CJS build. We deliberately do NOT use a dynamic
@@ -55,14 +78,22 @@ const GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"]
 let googleJwks: ReturnType<typeof createRemoteJWKSet> | null = null
 function googleKeySet(): ReturnType<typeof createRemoteJWKSet> {
   if (!googleJwks) {
-    googleJwks = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth2/v3/certs"))
+    googleJwks = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth2/v3/certs"), {
+      // A hung key server must not hold a sign-in open either.
+      timeoutDuration: 5_000,
+      cooldownDuration: 30_000,
+    })
   }
   return googleJwks
 }
 
-/** The verified upstream identity returned by Google's OIDC id_token. */
+/**
+ * A verified upstream identity. Named for its first producer (Google's OIDC id_token); it is now
+ * also what the SAML ACS and the X sign-in path hand to {@link finishSignIn}, so that every strategy
+ * produces one identical session.
+ */
 export interface OidcIdentity {
-  /** Google's stable subject identifier. */
+  /** The provider's stable subject identifier (Google `sub`, SAML nameID, X numeric user id). */
   sub: string
   email: string
   emailVerified: boolean
@@ -72,6 +103,15 @@ export interface OidcIdentity {
   givenName?: string
   familyName?: string
   picture?: string
+  /**
+   * WHICH STRATEGY VERIFIED THIS HUMAN. `finishSignIn` needs it because the admission rules are not
+   * the same for all three: `requireHostedDomain` asks for a Google Workspace `hd` claim, which is a
+   * thing only Google has. Optional, and absent means `google` — so every existing call site keeps
+   * its exact behaviour.
+   */
+  provider?: "google" | "saml" | "x"
+  /** The X handle, without the `@`. Set on the X path only; nothing else populates it. */
+  username?: string
 }
 
 /**
@@ -108,6 +148,27 @@ export interface GoogleConnectionConfig {
   hostedDomain?: string
 }
 
+/**
+ * An X (Twitter) OAuth 2.0 sign-in connection. `strategy` mirrors Federated's `oauth_x`.
+ *
+ * ⚠️ THE APPLICATION MUST BE REGISTERED AS A CONFIDENTIAL CLIENT ("Web App, Automated App or Bot"
+ * in the X developer portal). A "Native App" is a PUBLIC client: X issues it no secret, and the
+ * token exchange below authenticates the client with HTTP Basic.
+ */
+export interface XConnectionConfig {
+  strategy: "oauth_x"
+  /**
+   * X OAuth 2.0 client id. **Optional** (sign-in fails closed with a 503 if absent). Sourced and
+   * passed in by the embedding app, exactly as {@link GoogleConnectionConfig.clientId} is; the
+   * library reads no environment variable and no app-specific file.
+   */
+  clientId?: string
+  /** X OAuth 2.0 client secret. **Optional** — supplied the same way as {@link clientId}. */
+  clientSecret?: string
+  /** Must exactly match a Callback URI registered in the X app's *User authentication settings*. */
+  redirectUri: string
+}
+
 /** A SAML 2.0 sign-in connection. `strategy` mirrors Federated's enterprise SSO vocabulary. */
 export type SamlConnectionConfig = { strategy: "saml" } & SamlSpConfig
 
@@ -116,7 +177,10 @@ export type SamlConnectionConfig = { strategy: "saml" } & SamlSpConfig
  * (`oauth_google`, SAML) so credentials are passed by API in a Federated-idiomatic shape rather than
  * via a provider-specific block.
  */
-export type FederatedConnectionConfig = GoogleConnectionConfig | SamlConnectionConfig
+export type FederatedConnectionConfig =
+  | GoogleConnectionConfig
+  | SamlConnectionConfig
+  | XConnectionConfig
 
 /** Shape of the legacy Google block (`google: { ... }`) accepted as deprecated shorthand. */
 export interface LegacyGoogleConfig {
@@ -277,6 +341,22 @@ export interface FederatedFrontendConfig {
    */
   samlTrustAssertedEmailVerified?: boolean
   /**
+   * Admit an X sign-in on the strength of its `confirmed_email` alone, when
+   * {@link requireHostedDomain} is on. Defaults to false — FAIL CLOSED.
+   *
+   * WHY THIS FLAG HAS TO EXIST. `requireHostedDomain` asks for a Google Workspace `hd` claim, and
+   * its whole point is that membership of a Workspace is a stronger fact than an address that
+   * merely ends in the right domain. X has no equivalent: `confirmed_email` says X delivered mail
+   * to that address and nothing more. So an X sign-in CANNOT satisfy a hosted-domain requirement,
+   * and silently exempting it would quietly downgrade the control the deployment asked for on
+   * every account it protects. The operator says "I know, and the email is enough for X" here, in
+   * one place, or X sign-in is refused with that reason. Mirrors
+   * {@link samlTrustAssertedEmailVerified}, which exists for the same kind of reason.
+   *
+   * The {@link allowedDomains} allowlist still applies either way; this flag never bypasses it.
+   */
+  xTrustConfirmedEmail?: boolean
+  /**
    * Replay store for consumed SAML assertion ids (one-time-use enforcement). Defaults to an
    * in-process {@link InMemorySamlReplayStore}; supply a shared store for multi-process SAML.
    */
@@ -291,6 +371,79 @@ export interface FederatedFrontendConfig {
   /** Map a verified identity to roles/permissions/orgs. Defaults to a least-privilege grant. */
   resolveGrants?: (identity: OidcIdentity) => ResolvedGrants
   logger?: (level: "info" | "warn" | "error", message: string, meta?: unknown) => void
+  /**
+   * Admit a SAML sign-in under {@link requireHostedDomain} when the IdP asserts no hosted-domain
+   * attribute. Defaults to false — FAIL CLOSED.
+   *
+   * `requireHostedDomain` asks for a Google Workspace `hd` claim, which is a Google concept. A SAML
+   * IdP may assert an equivalent attribute (`hd` / `hostedDomain` / `domain`), and when it does the
+   * assertion satisfies the requirement on its own — this flag is not needed. Many IdPs assert
+   * nothing of the kind while nonetheless being scoped to exactly one verified company directory;
+   * an operator says so HERE, in one place, rather than the library quietly exempting every SAML
+   * sign-in from a control the deployment explicitly asked for. Mirrors {@link xTrustConfirmedEmail}.
+   *
+   * {@link allowedDomains} still applies either way; this flag never bypasses it.
+   */
+  samlSatisfiesHostedDomain?: boolean
+  /**
+   * Scope the minted user id to the strategy that authenticated it — `user_google_<sub>`,
+   * `user_saml_<nameID>`, `user_x_<id>` — instead of the flat `user_<sub>`. Defaults to **false**
+   * for back-compat.
+   *
+   * WHY IT MATTERS: without it, three strategies write into one identifier namespace. Google `sub`
+   * and X account id are both numeric strings, and a SAML `persistent` NameID is an
+   * operator-chosen opaque string, so nothing structurally prevents two different humans at two
+   * different IdPs from resolving to the same `user_…`. It also means one human who signs in via
+   * SAML on Monday and Google on Tuesday is silently two users with two grant sets.
+   *
+   * TURNING THIS ON IS A MIGRATION: every existing user id changes, so anything the host app
+   * persisted against the old id must be migrated with it. New deployments should set it true.
+   */
+  namespaceUserIds?: boolean
+  /**
+   * What a THROWN {@link revalidateGrants} does (only when `reresolveGrantsEverySeconds` is set).
+   *   - `"keep"` (DEFAULT): keep the existing grants for this mint and retry next window —
+   *     availability first, matching the historical behaviour.
+   *   - `"closed"`: treat the failure as a loss of authorization and sign the session out.
+   *
+   * The default is the riskier one on purpose (it is the pre-existing behaviour), but note what it
+   * means: if the resolver fails BECAUSE the upstream directory is unreachable — exactly when
+   * someone may have just been offboarded — deprovision latency silently reverts to the full
+   * session lifetime. Deployments that would rather sign a user out than carry stale grants through
+   * a directory outage set `"closed"`.
+   */
+  revalidateFailMode?: "keep" | "closed"
+  /**
+   * Timeout, in milliseconds, for every outbound call this middleware makes to an upstream IdP
+   * (Google's token endpoint, X's token and user endpoints). Defaults to 20000. A hung upstream
+   * otherwise holds the request, its socket and its closure open with the human watching a spinner.
+   */
+  upstreamTimeoutMs?: number
+  /**
+   * Per-request gate, consulted BEFORE any handler runs. Return false (or a rejected/false promise)
+   * to answer `429` and stop.
+   *
+   * The library cannot own a rate limiter — it is mounted middleware with no store and no view of
+   * the deployment — but it must expose the seam, because the routes that most need one are the
+   * ones it owns: `/saml/acs` does XML signature work before it can cheaply refuse anything, and
+   * `/oauth_callback/x` makes two outbound calls to X per unauthenticated request, which makes this
+   * library an amplifier against a third party's limits. Every refusal also writes a log line, so an
+   * unauthenticated flood is a log-volume DoS.
+   *
+   * A hook that THROWS is treated as a refusal (429): a limiter outage is not a reason to drop the
+   * limit on the auth endpoints.
+   */
+  rateLimit?: (ctx: RateLimitContext) => boolean | Promise<boolean>
+}
+
+/** What {@link FederatedFrontendConfig.rateLimit} is told about the request it is gating. */
+export interface RateLimitContext {
+  /** Upper-cased HTTP method. */
+  method: string
+  /** Path within the mount point, e.g. `/client/sessions/sess_1/tokens`. */
+  path: string
+  /** The raw request, for a limiter that keys on a header or the socket address. */
+  req: IncomingMessage
 }
 
 /**
@@ -404,6 +557,22 @@ function redactEmail(email: string, hmacKey?: Uint8Array): string {
   return `user_${digest}`
 }
 
+/**
+ * Strip anything from a log message that could forge a second log line.
+ *
+ * Several messages interpolate values an attacker influences — the presented email domain, the
+ * scope string X returned, X's own error text. Under any line-oriented log sink a CR/LF in one of
+ * those is an extra, attacker-authored audit entry. Applied centrally (see `normalizeConfig`) so it
+ * covers every call site, including ones added later: a per-call-site fix is a fix that the next
+ * `cfg.log(...)` forgets.
+ */
+const LOG_MESSAGE_MAX = 2000
+function sanitizeLogMessage(message: string): string {
+  // C0 controls (CR, LF, tab, NUL ...) and DEL collapse to a space, so the text stays readable
+  // while a newline can no longer start a line of its own.
+  return message.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, LOG_MESSAGE_MAX)
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
   res.statusCode = status
@@ -501,6 +670,15 @@ async function readFormBody(req: IncomingMessage): Promise<Record<string, string
   })
 }
 
+/**
+ * Recover the upstream subject from a minted user id, for sessions predating {@link
+ * SessionRecord.providerSub}. Strips the provider segment too, so a `namespaceUserIds` id does not
+ * yield a subject with `saml_`/`google_`/`x_` still glued to the front.
+ */
+function stripUserIdPrefix(userId: string): string {
+  return userId.replace(/^user_(?:google|saml|x)_/, "").replace(/^user_/, "")
+}
+
 function emailDomain(email: string): string {
   const at = email.lastIndexOf("@")
   return at < 0 ? "" : email.slice(at + 1).trim().toLowerCase()
@@ -556,7 +734,102 @@ interface SessionRecord {
   /** When the grants (roles/permissions/memberships) were last resolved (epoch seconds). Drives the
    *  optional on-mint re-resolution that bounds deprovision latency (reresolveGrantsEverySeconds). */
   grantsResolvedAt: number
+  /**
+   * The upstream subject EXACTLY as the IdP asserted it, and which strategy asserted it.
+   *
+   * Kept verbatim rather than recovered from {@link userId} by stripping a prefix. `userId` is a
+   * value WE mint, and its shape is configurable (`namespaceUserIds`), so parsing it back is a
+   * decoding step that silently desynchronises the moment the minting rule changes — and the thing
+   * it feeds is grant re-resolution, i.e. the authoritative "is this person still allowed?" call.
+   * Optional so a session cookie issued before this field existed still reads.
+   */
+  providerSub?: string
+  provider?: "google" | "saml" | "x"
 }
+
+/**
+ * Who is signed in on a request — the PUBLIC, read-only view of a session.
+ *
+ * This is the shape {@link FederatedFrontend.readBrowserSession} hands back to a host app. It is
+ * deliberately a subset of the library-internal `SessionRecord`: the bookkeeping field
+ * `grantsResolvedAt` exists only to schedule grant re-resolution inside the middleware, so it is not
+ * part of the contract a host app may depend on.
+ *
+ * A host app that server-renders a page (a consent screen, an admin view) must be able to answer
+ * "who is this?" from the SAME code path the Frontend API's `GET /client` uses. Reading and
+ * verifying the session cookie by hand in the host app is how the two halves drift apart — and a
+ * hand-rolled read is exactly the place where revocation, expiry and inactivity checks get skipped.
+ *
+ * That answer is also DELIBERATELY not derivable outside this module. The session cookie is signed
+ * with an HKDF subkey (`oaf:session`), not the master `sessionSecret`, precisely so that a leak of
+ * the secret used for access tokens cannot forge a session cookie — which also means
+ * `verifyToken()` cannot verify one, and a host that tried would have to re-derive the subkey and
+ * keep that derivation in step with this file forever. One implementation, exposed once, is the
+ * alternative to that drift.
+ */
+export interface BrowserSession {
+  /** Session id (the `sid` claim); the handle the /client/sessions/:id routes address. */
+  sid: string
+  /** Stable user id (`user_<hash>`). */
+  userId: string
+  /** Verified email address of the signed-in human. */
+  email: string
+  name?: string
+  firstName?: string
+  lastName?: string
+  /** Google Workspace hosted domain, when the upstream identity carried one. */
+  hd?: string
+  roles: string[]
+  permissions: string[]
+  /** Active organization, or null when the session has not selected one. */
+  orgId: string | null
+  memberships: OrgMembership[]
+  /** When the human last proved their identity upstream (epoch seconds). */
+  lastVerifiedAt: number
+}
+
+/**
+ * What {@link createFederatedFrontend} returns: the mountable Node/Express middleware, plus the
+ * session reader the host app needs for its own server-rendered routes.
+ *
+ * It stays CALLABLE with the exact signature it always had — `app.use("/api/v1", frontend)` is
+ * unchanged — so adding the method is not a breaking change for any existing embedder. The method
+ * hangs off the function rather than the function becoming an object because every current call
+ * site passes the return value straight to `app.use`.
+ */
+export interface FederatedFrontend {
+  (req: IncomingMessage, res: ServerResponse, next?: (err?: unknown) => void): void
+  /**
+   * Resolve the session on a request, or `null` when signed out.
+   *
+   * Runs the identical path `GET /client` runs — cookie signature verification, then, when a
+   * `sessionStore` is configured, the durable record's revoked / expired / inactive checks and the
+   * configured fail mode. So a session that was signed out, offboarded or timed out reads as
+   * signed-OUT here too, and a server-rendered page cannot disagree with the SPA about who is
+   * signed in.
+   *
+   * Read-only: it never mints, refreshes, touches or clears anything, and writes nothing to the
+   * response — safe to call from any route, including a GET that must stay side-effect free.
+   */
+  readBrowserSession(req: IncomingMessage): Promise<BrowserSession | null>
+  /**
+   * Verify an access token THIS frontend minted, using THIS frontend's secret, issuer and audience.
+   *
+   * Prefer it over the module-level `verifyToken()` in any process that mounts more than one
+   * frontend. `configureEmbeddedVerification()` writes one process-global variable, so a second
+   * `createFederatedFrontend()` would otherwise repoint the global at the second app — quietly
+   * verifying app A's requests against app B's secret and destroying the per-app `aud` isolation
+   * the config promises. This method reads no global state, so two apps in one process each keep
+   * their own verifier.
+   */
+  verifyToken(token: string, opts?: VerifyTokenOptions): Promise<TokenClaims>
+}
+
+/**
+ * Alias for {@link FederatedFrontend}, kept because the callable-plus-method shape reads as a
+ * "middleware" at the call sites that mount it. Both names describe the same value.
+ */
+export type FederatedFrontendMiddleware = FederatedFrontend
 
 /** Google config after credential resolution: id/secret are filled (possibly empty) strings. */
 interface ResolvedGoogleConfig {
@@ -566,8 +839,16 @@ interface ResolvedGoogleConfig {
   hostedDomain?: string
 }
 
+/** X config after resolution: id/secret are filled (possibly empty) strings. */
+interface ResolvedXConfig {
+  clientId: string
+  clientSecret: string
+  redirectUri: string
+}
+
 interface InternalConfig {
   google: ResolvedGoogleConfig
+  x: ResolvedXConfig
   saml?: SamlSpConfig
   allowedDomains: string[]
   sessionSecret: string
@@ -597,8 +878,17 @@ interface InternalConfig {
   securityHeaders: boolean
   allowedCorsOrigins: string[]
   issuer?: string
+  samlSatisfiesHostedDomain: boolean
+  namespaceUserIds: boolean
+  revalidateFailMode: "keep" | "closed"
+  upstreamTimeoutMs: number
+  rateLimit?: (ctx: RateLimitContext) => boolean | Promise<boolean>
   resolveGrants: (identity: OidcIdentity) => ResolvedGrants
   log: (level: "info" | "warn" | "error", message: string, meta?: unknown) => void
+  /** True only when the X client id, secret AND redirect URI all resolved to non-empty values. */
+  xConfigured: boolean
+  /** See {@link FederatedFrontendConfig.xTrustConfirmedEmail}. */
+  xTrustConfirmedEmail: boolean
   /** True only when both Google client id and secret resolved to non-empty values. */
   googleConfigured: boolean
   /** Secret-free, operator-actionable remediation text used when Google is unconfigured. */
@@ -613,12 +903,16 @@ interface InternalConfig {
 function normalizeConnections(config: FederatedFrontendConfig): {
   google?: LegacyGoogleConfig
   saml?: SamlSpConfig
+  x?: XConnectionConfig
 } {
   const connections = config.connections ?? []
   const googleConn = connections.find(
     (c): c is GoogleConnectionConfig => c.strategy === "oauth_google",
   )
   const samlConn = connections.find((c): c is SamlConnectionConfig => c.strategy === "saml")
+  // There is no legacy shorthand for X — it was added after `connections[]` became the idiom, so
+  // this is the only way to configure it and there is no second spelling to keep working.
+  const xConn = connections.find((c): c is XConnectionConfig => c.strategy === "oauth_x")
 
   const google: LegacyGoogleConfig | undefined = googleConn
     ? {
@@ -637,11 +931,11 @@ function normalizeConnections(config: FederatedFrontendConfig): {
     saml = config.saml
   }
 
-  return { google, saml }
+  return { google, saml, x: xConn }
 }
 
 function normalizeConfig(config: FederatedFrontendConfig): InternalConfig {
-  const { google: googleCfg, saml: samlCfg } = normalizeConnections(config)
+  const { google: googleCfg, saml: samlCfg, x: xCfg } = normalizeConnections(config)
 
   // Resolve the Google OAuth credentials the library was given (explicit config only — the library
   // reads no environment variable and no app-specific file; the embedding app sources the value and
@@ -657,6 +951,14 @@ function normalizeConfig(config: FederatedFrontendConfig): InternalConfig {
   const googleConfigured = resolved.ok
   const googleRemediation = resolved.ok ? "" : credentialsRemediation()
 
+  // X is configured or it is not; there is no partial state worth serving. All three values are
+  // required because the exchange cannot be attempted without any one of them, and a half-filled
+  // block that reported itself "configured" would fail at X with a 401 instead of here with a
+  // sentence naming the missing piece.
+  const xClientId = (xCfg?.clientId ?? "").trim()
+  const xClientSecret = (xCfg?.clientSecret ?? "").trim()
+  const xRedirectUri = (xCfg?.redirectUri ?? "").trim()
+
   return {
     google: {
       clientId,
@@ -664,6 +966,9 @@ function normalizeConfig(config: FederatedFrontendConfig): InternalConfig {
       redirectUri: googleCfg?.redirectUri ?? "",
       hostedDomain: googleCfg?.hostedDomain,
     },
+    x: { clientId: xClientId, clientSecret: xClientSecret, redirectUri: xRedirectUri },
+    xConfigured: Boolean(xClientId && xClientSecret && xRedirectUri),
+    xTrustConfirmedEmail: config.xTrustConfirmedEmail ?? false,
     googleConfigured,
     googleRemediation,
     saml: samlCfg?.enabled ? samlCfg : undefined,
@@ -706,13 +1011,27 @@ function normalizeConfig(config: FederatedFrontendConfig): InternalConfig {
     samlReplayStore: config.samlReplayStore ?? new InMemorySamlReplayStore(),
     securityHeaders: config.securityHeaders ?? true,
     allowedCorsOrigins: (config.allowedCorsOrigins ?? []).map((o) => o.trim()).filter(Boolean),
+    samlSatisfiesHostedDomain: config.samlSatisfiesHostedDomain ?? false,
+    namespaceUserIds: config.namespaceUserIds ?? false,
+    revalidateFailMode: config.revalidateFailMode === "closed" ? "closed" : "keep",
+    upstreamTimeoutMs:
+      typeof config.upstreamTimeoutMs === "number" && config.upstreamTimeoutMs > 0
+        ? config.upstreamTimeoutMs
+        : 20_000,
+    rateLimit: config.rateLimit,
     resolveGrants: config.resolveGrants ?? defaultResolveGrants,
-    log:
-      config.logger ??
-      ((level, message, meta) => {
-        // Default: quiet on info, surface problems.
-        if (level !== "info") console[level](`[auth-frontend] ${message}`, meta ?? "")
-      }),
+    // Every message is scrubbed of control characters on the way out — see sanitizeLogMessage.
+    // Wrapping the sink (rather than each call site) is what makes it hold for call sites added
+    // later, and it applies to a host-supplied logger too, which is where the messages actually go.
+    log: ((): InternalConfig["log"] => {
+      const sink =
+        config.logger ??
+        ((level: "info" | "warn" | "error", message: string, meta?: unknown) => {
+          // Default: quiet on info, surface problems.
+          if (level !== "info") console[level](`[auth-frontend] ${message}`, meta ?? "")
+        })
+      return (level, message, meta) => sink(level, sanitizeLogMessage(String(message)), meta)
+    })(),
   }
 }
 
@@ -724,9 +1043,7 @@ function normalizeConfig(config: FederatedFrontendConfig): InternalConfig {
  *   `createFederatedFrontend({ connections: [{ strategy: 'oauth_google', clientId, clientSecret,
  *     redirectUri }], allowedDomains, sessionSecret })`
  */
-export function createFederatedFrontend(
-  config: FederatedFrontendConfig,
-): (req: IncomingMessage, res: ServerResponse, next?: (err?: unknown) => void) => void {
+export function createFederatedFrontend(config: FederatedFrontendConfig): FederatedFrontend {
   const cfg = normalizeConfig(config)
 
   // Fail closed on a weak/placeholder/short secret (mirrors verify.ts, which throws). Signing real
@@ -804,10 +1121,13 @@ export function createFederatedFrontend(
     // a clear 503 (see guardGoogleConfigured) instead of redirecting to Google with an empty
     // client_id. The remediation text is source-agnostic (it names no host file path — that is the
     // embedding app's concern; see credentialsRemediation) and contains no secrets.
+    // The multi-line remediation rides in `meta`, not in the message: log messages are scrubbed of
+    // newlines (sanitizeLogMessage) so an attacker-influenced value cannot forge an audit line, and
+    // folding this block into the message would flatten it for no benefit.
     cfg.log(
       "warn",
-      "Google OAuth client is not configured; Google sign-in routes will return 503 until it is.\n" +
-        cfg.googleRemediation,
+      "Google OAuth client is not configured; Google sign-in routes will return 503 until it is.",
+      { remediation: cfg.googleRemediation },
     )
   }
   async function signSession(record: SessionRecord): Promise<string> {
@@ -824,6 +1144,8 @@ export function createFederatedFrontend(
       memberships: record.memberships,
       lvc: record.lastVerifiedAt,
       gra: record.grantsResolvedAt,
+      psub: record.providerSub,
+      prv: record.provider,
     })
       .setProtectedHeader({ alg: "HS256" })
       .setSubject(record.userId)
@@ -850,6 +1172,8 @@ export function createFederatedFrontend(
       memberships: Array.isArray(s.memberships) ? s.memberships : [],
       lastVerifiedAt: s.lastVerifiedAt ?? Math.floor(Date.now() / 1000),
       grantsResolvedAt: s.grantsResolvedAt ?? s.lastVerifiedAt ?? Math.floor(Date.now() / 1000),
+      providerSub: s.providerSub,
+      provider: s.provider,
     }
   }
 
@@ -881,6 +1205,8 @@ export function createFederatedFrontend(
       lastVerifiedAt: (payload.lvc as number) ?? Math.floor(Date.now() / 1000),
       grantsResolvedAt:
         (payload.gra as number) ?? (payload.lvc as number) ?? Math.floor(Date.now() / 1000),
+      providerSub: payload.psub as string | undefined,
+      provider: payload.prv as "google" | "saml" | "x" | undefined,
     }
 
     // Stateless mode (no store): the signed cookie IS the whole session — return it as before.
@@ -1010,8 +1336,14 @@ export function createFederatedFrontend(
   /** Reconstruct the minimal upstream identity from a live session, for grant re-resolution. */
   function identityFromSession(session: SessionRecord): OidcIdentity {
     return {
-      sub: session.userId.startsWith("user_") ? session.userId.slice("user_".length) : session.userId,
+      // The stored upstream subject, when the session carries one. The fallback is only for a
+      // session established before `providerSub` existed, and it strips ONLY the prefixes this
+      // library can mint — including the `namespaceUserIds` form, which the old `user_`-only strip
+      // left mangled (`user_saml_alice@corp.com` became `saml_alice@corp.com`, a subject that never
+      // existed upstream, silently missing every host lookup keyed on `sub`).
+      sub: session.providerSub ?? stripUserIdPrefix(session.userId),
       email: session.email,
+      provider: session.provider,
       // The identity was authenticated at sign-in; re-resolution re-checks AUTHORIZATION (grants),
       // not authentication, so this is treated as verified.
       emailVerified: true,
@@ -1042,10 +1374,17 @@ export function createFederatedFrontend(
     try {
       fresh = await resolver(identityFromSession(session))
     } catch (err) {
-      // A transient resolver error must not lock the user out mid-session: keep existing grants and
-      // retry on the next window.
-      cfg.log("warn", "grant re-resolution threw; keeping existing grants for this mint", err)
-      return "ok"
+      // A transient resolver error is ambiguous, and the two readings pull opposite ways: it may be
+      // a blip (locking the user out mid-session would be wrong), or it may be the directory being
+      // unreachable at exactly the moment someone was offboarded (carrying stale grants would be
+      // wrong). The operator chooses; the default keeps the historical behaviour.
+      if (cfg.revalidateFailMode === "closed") {
+        cfg.log("warn", "grant re-resolution threw; failing closed and signing the session out", err)
+        fresh = null
+      } else {
+        cfg.log("warn", "grant re-resolution threw; keeping existing grants for this mint", err)
+        return "ok"
+      }
     }
 
     if (!fresh) {
@@ -1099,6 +1438,8 @@ export function createFederatedFrontend(
     domain?: string
     /** True when this round-trip is a step-up reverify (don't re-establish, just re-stamp). */
     reverify?: boolean
+    /** Which strategy opened this round trip. Absent means Google (every pre-X state cookie). */
+    provider?: "google" | "x"
   }): Promise<string> {
     return await new SignJWT(state as unknown as Record<string, unknown>)
       .setProtectedHeader({ alg: "HS256" })
@@ -1115,6 +1456,7 @@ export function createFederatedFrontend(
     redirectUrlComplete: string
     domain?: string
     reverify?: boolean
+    provider?: "google" | "x"
   } | null> {
     const raw = parseCookies(req)[cfg.stateCookieName]
     if (!raw) return null
@@ -1149,8 +1491,8 @@ export function createFederatedFrontend(
     if (cfg.googleConfigured) return false
     cfg.log(
       "error",
-      "Refusing to start Google sign-in: OAuth client credentials are not configured.\n" +
-        cfg.googleRemediation,
+      "Refusing to start Google sign-in: OAuth client credentials are not configured.",
+      { remediation: cfg.googleRemediation },
     )
     sendJson(res, 503, {
       error: "oauth_not_configured",
@@ -1162,6 +1504,235 @@ export function createFederatedFrontend(
       remediation: cfg.googleRemediation,
     })
     return true
+  }
+
+  /**
+   * The X counterpart of {@link guardGoogleConfigured}. Returns true (and has answered) when X
+   * sign-in cannot be started, so the caller does nothing further.
+   */
+  function guardXConfigured(res: ServerResponse): boolean {
+    if (cfg.xConfigured) return false
+    cfg.log("error", "Refusing to start X sign-in: OAuth client credentials are not configured.")
+    sendJson(res, 503, {
+      error: "oauth_not_configured",
+      error_message:
+        "X sign-in is not configured on the server. An administrator must supply the X OAuth " +
+        "client id, client secret and callback URI to the embedding app, which passes them into " +
+        "createFederatedFrontend() as a connection with strategy 'oauth_x'. The application must " +
+        "be registered as a CONFIDENTIAL client (\"Web App, Automated App or Bot\") in the X " +
+        "developer portal — a Native App is issued no client secret.",
+    })
+    return true
+  }
+
+  /**
+   * GET /sign_in/sso?strategy=x — hand the browser X's own authorization screen.
+   *
+   * The same shape as the Google start below (state + PKCE in one short-lived signed cookie), with
+   * two differences that are X's, not ours: PKCE is MANDATORY even for a confidential client, and
+   * there is no `nonce` because there is no id_token to bind one to.
+   */
+  async function handleXSsoStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const q = queryOf(req)
+    const redirectUrl = q.get("redirect_url") || "/sso-callback"
+    const redirectUrlComplete = q.get("redirect_url_complete") || "/"
+
+    const state = base64url(randomBytes(24))
+    const codeVerifier = base64url(randomBytes(32))
+    const codeChallenge = base64url(createHash("sha256").update(codeVerifier).digest())
+
+    const stateJwt = await signState({
+      state,
+      nonce: "",
+      codeVerifier,
+      redirectUrl,
+      redirectUrlComplete,
+      provider: "x",
+    })
+    setCookie(res, cfg.stateCookieName, stateJwt, {
+      maxAgeSeconds: STATE_TTL_SECONDS,
+      secure: cfg.cookieSecure,
+    })
+
+    const authUrl = new URL(X_AUTH_URL)
+    authUrl.searchParams.set("response_type", "code")
+    authUrl.searchParams.set("client_id", cfg.x.clientId)
+    authUrl.searchParams.set("redirect_uri", cfg.x.redirectUri)
+    authUrl.searchParams.set("scope", X_SCOPES)
+    authUrl.searchParams.set("state", state)
+    authUrl.searchParams.set("code_challenge", codeChallenge)
+    authUrl.searchParams.set("code_challenge_method", "S256")
+    redirect(res, authUrl.toString())
+  }
+
+  /**
+   * GET /oauth_callback/x — exchange the code, read who signed in, then join the shared tail.
+   *
+   * Deliberately a SEPARATE PATH from `/oauth_callback` rather than a branch inside it. X's callback
+   * URI has to be registered in X's portal as an exact string, Google's in Google's console as an
+   * exact string, and one path serving both means either console can be edited into breaking the
+   * other provider's sign-in with nothing on either screen to say so.
+   */
+  async function handleXCallback(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const q = queryOf(req)
+    const saved = await readState(req)
+    const redirectUrlComplete = saved?.redirectUrlComplete ?? q.get("redirect_url_complete") ?? "/"
+    const fallbackRedirect = safeRedirectTarget(saved?.redirectUrl ?? "/sso-callback")
+    clearCookie(res, cfg.stateCookieName, cfg.cookieSecure)
+
+    const code = q.get("code") ?? ""
+    const returnedState = q.get("state") ?? ""
+    // X reports a refusal on the query string; it is the ordinary "not now" and is not an error.
+    if (q.get("error")) {
+      cfg.log("info", `X sign-in was not completed: ${String(q.get("error")).slice(0, 64)}`)
+      return backToApp(res, fallbackRedirect, {
+        error: "sign_in_not_completed",
+        error_message: "Sign-in with X was cancelled.",
+        redirect_url_complete: redirectUrlComplete,
+      })
+    }
+    // `state` is the CSRF token: a callback carrying one this install never issued is not a
+    // callback. The provider check closes the matching hole — a Google state cookie must not be
+    // spendable at the X callback, or the two round trips become interchangeable.
+    if (
+      !code ||
+      !saved ||
+      saved.provider !== "x" ||
+      !constantTimeEqual(returnedState, saved.state)
+    ) {
+      cfg.log("warn", "X callback rejected: the saved SSO state is missing, expired or mismatched")
+      return backToApp(res, fallbackRedirect, {
+        error: "sign_in_not_completed",
+        error_message: "Sign-in could not be verified. Please try again.",
+        redirect_url_complete: redirectUrlComplete,
+      })
+    }
+
+    let accessToken: string
+    // X returns the scopes it ACTUALLY granted, which is not always what we asked for: a citizen can
+    // clear a checkbox on the consent screen, and an app without "Request email from users" is
+    // silently refused `users.email` altogether. That string is the difference between "this person
+    // has no confirmed email" and "this app was never allowed to ask", and nothing else distinguishes
+    // them — so it is captured here and named in the log line below.
+    let grantedScopes = ""
+    try {
+      // A confidential client authenticates with HTTP Basic. `client_id` also rides in the body,
+      // which X accepts and which keeps the request valid if the app is ever re-registered public.
+      const basic = Buffer.from(`${cfg.x.clientId}:${cfg.x.clientSecret}`).toString("base64")
+      const tokenRes = await fetch(X_TOKEN_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Authorization: `Basic ${basic}`,
+        },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: cfg.x.clientId,
+          redirect_uri: cfg.x.redirectUri,
+          code_verifier: saved.codeVerifier,
+        }),
+        signal: AbortSignal.timeout(cfg.upstreamTimeoutMs),
+      })
+      if (!tokenRes.ok) {
+        // Never log the body: a token error response can quote the code, or the token itself.
+        cfg.log("error", `X token exchange failed (${tokenRes.status})`)
+        return backToApp(res, fallbackRedirect, {
+          error: "sign_in_not_completed",
+          error_message: "Could not complete sign-in with X.",
+          redirect_url_complete: redirectUrlComplete,
+        })
+      }
+      const tokenJson = (await tokenRes.json()) as { access_token?: string; scope?: string }
+      if (!tokenJson.access_token) throw new Error("no access_token in token response")
+      accessToken = tokenJson.access_token
+      grantedScopes = typeof tokenJson.scope === "string" ? tokenJson.scope : ""
+    } catch (err) {
+      cfg.log("error", "X token exchange threw", err instanceof Error ? err.message : err)
+      return backToApp(res, fallbackRedirect, {
+        error: "sign_in_not_completed",
+        error_message: "Could not reach X to complete sign-in.",
+        redirect_url_complete: redirectUrlComplete,
+      })
+    }
+
+    let identity: OidcIdentity
+    try {
+      identity = await fetchXIdentity(accessToken, grantedScopes)
+    } catch (err) {
+      cfg.log("error", "reading the signed-in X account failed", err instanceof Error ? err.message : err)
+      return backToApp(res, fallbackRedirect, {
+        error: "sign_in_not_completed",
+        error_message: "Could not verify your X identity.",
+        redirect_url_complete: redirectUrlComplete,
+      })
+    }
+
+    return finishSignIn(res, identity, fallbackRedirect, redirectUrlComplete)
+  }
+
+  /**
+   * GET /2/users/me under the citizen's own access token — the whole of what X tells us about them.
+   *
+   * `confirmed_email` is the reason `users.email` is in the scope list. It comes back only when the
+   * application has "Request email from users" enabled AND the account has a confirmed address, so
+   * its ABSENCE IS ORDINARY and is not treated as a failure here: the identity is returned with an
+   * empty email and `finishSignIn` refuses it with the same sentence any unverified identity gets.
+   * Deciding admissibility in the one place that decides it for every strategy is the point.
+   */
+  async function fetchXIdentity(accessToken: string, grantedScopes = ""): Promise<OidcIdentity> {
+    const url = new URL(X_ME_URL)
+    url.searchParams.set("user.fields", "confirmed_email,profile_image_url,username")
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(cfg.upstreamTimeoutMs),
+    })
+    if (!res.ok) throw new Error(`X answered HTTP ${res.status} for /2/users/me`)
+    const body = (await res.json()) as {
+      data?: {
+        id?: unknown
+        name?: unknown
+        username?: unknown
+        confirmed_email?: unknown
+        profile_image_url?: unknown
+      }
+      // X answers 200 with a PARTIAL `data` plus an `errors[]` saying which field it would not
+      // serve and why — an unauthorized field is not an HTTP error. Read before this, a missing
+      // email looked identical to an account that simply has none.
+      errors?: Array<{ title?: unknown; detail?: unknown; parameter?: unknown }>
+    }
+    const sub = typeof body.data?.id === "string" ? body.data.id : ""
+    if (!sub) throw new Error("X answered without an account id")
+    const email = typeof body.data?.confirmed_email === "string" ? body.data.confirmed_email : ""
+    if (!email) {
+      // THE NAMED GAP. Never the address itself — only whether one arrived, what X was willing to
+      // grant, and X's own words about the field it withheld. Without this line the citizen is told
+      // "a verified email is required" and the operator has nothing at all to act on.
+      const said = (body.errors ?? [])
+        .map((e) => [e.title, e.parameter, e.detail].filter((v) => typeof v === "string").join(": "))
+        .filter(Boolean)
+        .join(" | ")
+      cfg.log(
+        "warn",
+        "X returned no confirmed_email, so this sign-in cannot be admitted. " +
+          `Scopes X actually granted: "${grantedScopes || "(none reported)"}". ` +
+          (said ? `X said: ${said}. ` : "X reported no error on the field. ") +
+          "If `users.email` is missing from the granted scopes, enable \"Request email from users\" " +
+          "in the X developer portal (it needs the app's privacy-policy and terms URLs) and have the " +
+          "citizen re-authorize. If it IS granted, the account has no confirmed email address on X.",
+      )
+    }
+    return {
+      sub,
+      email,
+      // X's own word for the field is "confirmed". There is no separate verification flag to read,
+      // so the presence of the address IS the assertion — and an absent one stays unverified.
+      emailVerified: Boolean(email),
+      name: typeof body.data?.name === "string" ? body.data.name : undefined,
+      username: typeof body.data?.username === "string" ? body.data.username : undefined,
+      picture: typeof body.data?.profile_image_url === "string" ? body.data.profile_image_url : undefined,
+      provider: "x",
+    }
   }
 
   async function handleSsoStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1192,6 +1763,7 @@ export function createFederatedFrontend(
       redirectUrlComplete,
       domain: hostedDomain,
       reverify,
+      provider: "google",
     })
     setCookie(res, cfg.stateCookieName, stateJwt, {
       maxAgeSeconds: STATE_TTL_SECONDS,
@@ -1293,6 +1865,17 @@ export function createFederatedFrontend(
       })
     }
 
+    // A state cookie minted for the X round trip must not be spendable here (and vice versa in
+    // handleXCallback). Absent means Google: every state cookie issued before X existed.
+    if (saved.provider === "x") {
+      cfg.log("warn", "Google callback rejected: the saved SSO state belongs to the X round trip")
+      return backToApp(res, fallbackRedirect, {
+        error: "sign_in_not_completed",
+        error_message: "Sign-in could not be verified. Please try again.",
+        redirect_url_complete: redirectUrlComplete,
+      })
+    }
+
     // Exchange the authorization code for tokens (PKCE).
     let idToken: string
     try {
@@ -1307,6 +1890,10 @@ export function createFederatedFrontend(
           redirect_uri: cfg.google.redirectUri,
           code_verifier: saved.codeVerifier,
         }),
+        // Bounded like the X exchange below. Without this a hung connection to Google holds the
+        // request, its socket and this closure until Node's default socket timeout, and the human
+        // just watches a spinner.
+        signal: AbortSignal.timeout(cfg.upstreamTimeoutMs),
       })
       if (!tokenRes.ok) {
         // Do NOT log the raw provider error body — it can carry sensitive request detail. The
@@ -1405,9 +1992,20 @@ export function createFederatedFrontend(
   ): Promise<void> {
     // Domain enforcement (authentication.mdx §3): require a verified email on an allowed domain.
     if (!identity.email || !identity.emailVerified) {
+      // This branch refused in SILENCE until 2026-08-31: the citizen saw one sentence and the trail
+      // held nothing, so "which provider, and was the address missing or merely unverified?" could
+      // not be answered from the logs at all.
+      cfg.log(
+        "warn",
+        `Rejecting ${identity.provider ?? "google"} sign-in: ` +
+          (identity.email ? "the provider did not assert the email as verified" : "the provider returned no email address"),
+      )
       return backToApp(res, fallbackRedirect, {
         error: "identity_domain_not_allowed",
-        error_message: "A verified company email is required.",
+        error_message:
+          identity.provider === "x"
+            ? "X did not give us a confirmed email address for your account, so we cannot sign you in."
+            : "A verified company email is required.",
         presented_domain: "",
         redirect_url_complete: redirectUrlComplete,
       })
@@ -1416,17 +2014,58 @@ export function createFederatedFrontend(
     // `hd` (Workspace-membership) claim — NOT the email domain. An identity that merely ends in an
     // allowlisted domain but is not a Workspace member (no hd) is rejected. When not gated, fall
     // back to the email domain for back-compat.
+    const provider = identity.provider ?? "google"
     const hd = identity.hd?.toLowerCase()
-    if (cfg.requireHostedDomain && !hd) {
-      cfg.log("warn", "Rejecting sign-in: hosted-domain (hd) claim required but absent")
+    // X HAS NO HOSTED-DOMAIN CLAIM AND NEVER WILL. `confirmed_email` says X delivered mail to that
+    // address; it asserts nothing about membership of an organization, which is the whole of what
+    // requireHostedDomain is for. So an X identity is admissible under that setting only when the
+    // operator has explicitly said the confirmed email is enough (xTrustConfirmedEmail). Without
+    // that, X sign-in is refused HERE and the citizen is told which of the two facts is missing —
+    // rather than exempting X quietly, which would weaken the control on every account it guards.
+    const xExempt = provider === "x" && cfg.xTrustConfirmedEmail
+    // SAML's counterpart to the X exemption. A SAML IdP that DOES assert a hosted-domain attribute
+    // needs nothing here — `hd` is populated and the check passes on its own merits. This covers the
+    // common IdP that asserts no such attribute but is nonetheless scoped to one verified company
+    // directory, and it exists so the operator states that in one place rather than the library
+    // exempting every SAML sign-in silently. Without it, `requireHostedDomain` refused 100% of SAML
+    // sign-ins — which, since the charter makes SAML 2.0 the go-forward default, pushed operators to
+    // switch the control off for the OIDC path too.
+    const samlExempt = provider === "saml" && cfg.samlSatisfiesHostedDomain
+    const hdExempt = xExempt || samlExempt
+    if (cfg.requireHostedDomain && !hd && !hdExempt) {
+      cfg.log("warn", `Rejecting ${provider} sign-in: hosted-domain (hd) claim required but absent`)
       return backToApp(res, fallbackRedirect, {
         error: "identity_domain_not_allowed",
-        error_message: "This app requires a Google Workspace account (hosted domain).",
+        error_message:
+          provider === "x"
+            ? "This app requires a Google Workspace account, so sign-in with X is not accepted here."
+            : provider === "saml"
+              ? "This app requires an account whose identity provider asserts a verified company domain."
+              : "This app requires a Google Workspace account (hosted domain).",
         presented_domain: "",
         redirect_url_complete: redirectUrlComplete,
       })
     }
-    const presentedDomain = (cfg.requireHostedDomain ? hd : hd || emailDomain(identity.email)) ?? ""
+    // The allowlist still runs for every strategy — the exemptions above are from the `hd`
+    // requirement only, never from allowedDomains, so an admitted account still has to present an
+    // allowed domain.
+    //
+    // SAML IS EVALUATED ON ITS EMAIL DOMAIN, NEVER ON THE ASSERTED `hd`. The two hosted-domain
+    // claims are not the same kind of fact. Google computes `hd` itself from real Workspace
+    // membership and will not assert a domain the account is not in; a SAML `hd` is just an
+    // attribute whose value the IdP chose, and attribute mapping is exactly the thing that gets
+    // misconfigured. Letting it stand in for the email domain here would mean an assertion for
+    // `attacker@evil.example` carrying `hd: company.com` satisfies a `company.com` allowlist — the
+    // allowlist stops gating who may sign in and starts gating what the IdP claims about them.
+    //
+    // So for SAML the asserted `hd` does exactly one job: satisfying `requireHostedDomain` above.
+    // Admission is still decided by the address the assertion is actually for.
+    const presentedDomain =
+      (provider === "saml"
+        ? emailDomain(identity.email)
+        : cfg.requireHostedDomain && !hdExempt
+          ? hd
+          : hd || emailDomain(identity.email)) ?? ""
     if (!presentedDomain || !cfg.allowedDomains.includes(presentedDomain)) {
       cfg.log("warn", `Rejecting sign-in from non-allowed domain: ${presentedDomain || "unknown"}`)
       return backToApp(res, fallbackRedirect, {
@@ -1443,18 +2082,28 @@ export function createFederatedFrontend(
     const now = Math.floor(Date.now() / 1000)
     const session: SessionRecord = {
       sid: `sess_${base64url(randomBytes(12))}`,
-      userId: `user_${identity.sub}`,
+      // Optionally scoped to the issuing strategy so Google, SAML and X do not share one flat
+      // identifier namespace. Off by default because turning it on rewrites every user id.
+      userId: cfg.namespaceUserIds ? `user_${provider}_${identity.sub}` : `user_${identity.sub}`,
       email: identity.email,
       name: identity.name,
       firstName: identity.givenName,
       lastName: identity.familyName,
-      hd: identity.hd ?? presentedDomain,
+      // `hd` ONLY when the upstream actually asserted one. It used to fall back to
+      // `presentedDomain`, which outside the requireHostedDomain path is just the email suffix — so
+      // a downstream service reading `claims.hd` as "Google Workspace membership" (which is what the
+      // name means everywhere else here) was reading an unverified string. The email domain is
+      // available from `email`; it does not need to masquerade as a hosted-domain claim.
+      hd: identity.hd,
       roles: grants.roles,
       permissions: grants.permissions,
       orgId: grants.orgId,
       memberships: grants.memberships,
       lastVerifiedAt: now,
       grantsResolvedAt: now,
+      // Kept verbatim so grant re-resolution asks about the subject the IdP actually named.
+      providerSub: identity.sub,
+      provider,
     }
     const sessionJwt = await signSession(session)
     setCookie(res, cfg.sessionCookieName, sessionJwt, {
@@ -1507,6 +2156,7 @@ export function createFederatedFrontend(
       user_settings: {
         social: {
           oauth_google: { enabled: cfg.googleConfigured, strategy: "oauth_google" },
+          oauth_x: { enabled: cfg.xConfigured, strategy: "oauth_x" },
         },
         saml: { enabled: Boolean(cfg.saml) },
       },
@@ -1836,7 +2486,7 @@ export function createFederatedFrontend(
 
   // --- router --------------------------------------------------------------------------------
 
-  return (req, res, next) => {
+  const handler = ((req, res, next) => {
     const path = pathOf(req)
     const method = (req.method ?? "GET").toUpperCase()
 
@@ -1847,10 +2497,14 @@ export function createFederatedFrontend(
         const o = req.headers?.origin
         return Array.isArray(o) ? o[0] : o
       })()
+      // Unconditional: once CORS is configured, the response content depends on Origin whether or
+      // not this particular Origin matched, and a cache must be told so either way. Setting it only
+      // on the matching branch lets a shared cache serve a no-CORS response to an allowlisted origin
+      // (or the reverse) without ever knowing the two differ.
+      res.setHeader("Vary", "Origin")
       if (origin && cfg.allowedCorsOrigins.includes(origin)) {
         res.setHeader("Access-Control-Allow-Origin", origin)
         res.setHeader("Access-Control-Allow-Credentials", "true")
-        res.setHeader("Vary", "Origin")
         res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type")
         res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
       }
@@ -1862,16 +2516,38 @@ export function createFederatedFrontend(
     }
 
     const route = async (): Promise<boolean> => {
+      // Gate FIRST, so a refusal costs nothing: no XML parsing on /saml/acs, no outbound call to
+      // Google or X, no log line per refused request. A hook that throws is a refusal — a limiter
+      // outage must not silently remove the limit from the auth endpoints.
+      if (cfg.rateLimit) {
+        let allowed: boolean
+        try {
+          allowed = (await cfg.rateLimit({ method, path, req })) !== false
+        } catch (err) {
+          cfg.log("warn", "rateLimit hook threw; refusing the request (fail closed)", err)
+          allowed = false
+        }
+        if (!allowed) {
+          sendJson(res, 429, { error: "rate_limited" })
+          return true
+        }
+      }
       if (method === "GET" && path === "/sign_in/sso") {
         // Unified sign-in entry point: strategy=saml routes to the SAML SP path (when
         // configured); everything else is the Google OIDC path.
         const strategy = queryOf(req).get("strategy") ?? ""
         if (strategy === "saml" && cfg.saml) await handleSamlLogin(req, res)
-        else if (!guardGoogleConfigured(res)) await handleSsoStart(req, res)
+        else if (strategy === "x") {
+          if (!guardXConfigured(res)) await handleXSsoStart(req, res)
+        } else if (!guardGoogleConfigured(res)) await handleSsoStart(req, res)
         return true
       }
       if (method === "GET" && path === "/oauth_callback") {
         if (!guardGoogleConfigured(res)) await handleCallback(req, res)
+        return true
+      }
+      if (method === "GET" && path === "/oauth_callback/x") {
+        if (!guardXConfigured(res)) await handleXCallback(req, res)
         return true
       }
       // SAML 2.0 SP routes (served only when a `saml` config block is present + enabled).
@@ -1937,6 +2613,56 @@ export function createFederatedFrontend(
         cfg.log("error", "auth-frontend handler threw", err instanceof Error ? err.message : err)
         if (!res.headersSent) sendJson(res, 500, { error: "internal_error" })
       })
+  }) as FederatedFrontend
+
+  // The session reader, exposed on the middleware itself. It delegates to the SAME internal
+  // `readSession` the routes above use — that shared implementation is the point. `publicSession`
+  // strips the internal-only bookkeeping field so the contract stays the documented one.
+  handler.readBrowserSession = async (req: IncomingMessage): Promise<BrowserSession | null> => {
+    const session = await readSession(req)
+    return session ? publicSession(session) : null
+  }
+
+  // This app's own verifier, closed over this app's config — never the process-global one.
+  const ownVerifier = createEmbeddedVerifier({
+    sessionSecret: cfg.sessionSecret,
+    issuer: cfg.issuer,
+    audience: cfg.audience,
+  })
+  handler.verifyToken = (token: string, opts: VerifyTokenOptions = {}) => ownVerifier(token, opts)
+
+  return handler
+}
+
+/** Project the library-internal session record onto the public {@link BrowserSession} contract. */
+function publicSession(s: {
+  sid: string
+  userId: string
+  email: string
+  name?: string
+  firstName?: string
+  lastName?: string
+  hd?: string
+  roles: string[]
+  permissions: string[]
+  orgId: string | null
+  memberships: OrgMembership[]
+  lastVerifiedAt: number
+}): BrowserSession {
+  return {
+    sid: s.sid,
+    userId: s.userId,
+    email: s.email,
+    name: s.name,
+    firstName: s.firstName,
+    lastName: s.lastName,
+    hd: s.hd,
+    // Copy the arrays: a host app must not be able to mutate the live session record it was handed.
+    roles: [...s.roles],
+    permissions: [...s.permissions],
+    orgId: s.orgId,
+    memberships: [...s.memberships],
+    lastVerifiedAt: s.lastVerifiedAt,
   }
 }
 
